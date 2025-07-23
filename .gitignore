@@ -37,6 +37,9 @@ apex/
 *.bin
 *.pickle
 *.txt
+*.ply
+*.glb
+
 
 # Other uncheckable file types
 *.zip
@@ -245,3 +248,10 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# directories
+rendered/
+fused/
+
+# files
+cosmos_predict1/diffusion/inference/verifyPointCloudDimensions.ipynb
