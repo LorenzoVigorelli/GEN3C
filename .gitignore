@@ -255,3 +255,4 @@ fused/
 
 # files
 cosmos_predict1/diffusion/inference/verifyPointCloudDimensions.ipynb
+cosmos_predict1/diffusion/inference/gen3cSingleImageWorkingOn.py

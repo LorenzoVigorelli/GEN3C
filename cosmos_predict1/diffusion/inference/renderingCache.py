@@ -217,207 +217,53 @@ def _predict_moge_depth_from_tensor(
     return moge_depth_11hw, moge_mask_11hw
 
 def load_ply_robust(ply_path):
-    """Carica PLY gestendo diversi formati di colori"""
+    """Load a PLY file, handling various color formats"""
     pcd = o3d.io.read_point_cloud(ply_path)
     pts_np = np.asarray(pcd.points, dtype=np.float32)
     
-
+    # If there are no colors, return points only
     if not pcd.has_colors():
         return pts_np, None
     
     colors_raw = np.asarray(pcd.colors)
     
-    # Gestione intelligente del range colori
+    # Smart handling of color ranges
     if colors_raw.max() <= 1.0:
+        # Colors are in [0,1] float range
         cols_np = (colors_raw * 255).astype(np.uint8)
     elif colors_raw.max() <= 255.0:
+        # Colors are already in [0,255] range
         cols_np = colors_raw.astype(np.uint8)
     else:
+        # Clamp any values outside [0,255]
         cols_np = np.clip(colors_raw, 0, 255).astype(np.uint8)
      
     return pts_np, cols_np
 
-def create_zbuffer_projection_improved(ply_path, w2c_matrix, intrinsics, height, width, device='cuda', debug=True):
-    """
-    Proiezione Z-buffer migliorata con diagnostica colori e maschera binaria
-    """
-    # 1) Carica PLY
-    pts_np, cols_np = load_ply_robust(ply_path)
-    if cols_np is None:
-        cols_np = np.full((len(pts_np), 3), [255, 0, 0], dtype=np.uint8)
-    
-    # 2) Setup Z-Buffer, immagine e maschera
-    Z_buf = np.full((height, width), np.inf, dtype=np.float32)
-    Img   = np.zeros((height, width, 3), dtype=np.uint8)
-    Mask  = np.zeros((height, width), dtype=np.uint8)  # 0=buco, 1=presente
-    
-    # Statistiche
-    projected_count = behind_camera = out_of_bounds = 0
-    
-    for k, p in enumerate(pts_np):
-        # punto omogeneo
-        point_3d = np.append(p, 1.0)
-        # coord in camera
-        if isinstance(w2c_matrix, torch.Tensor):
-            X_cam = (w2c_matrix.cpu().numpy() @ point_3d)[:3]
-        else:
-            X_cam = (w2c_matrix @ point_3d)[:3]
-        if X_cam[2] <= 0:
-            behind_camera += 1
-            continue
-        
-        # intrinseche
-        if isinstance(intrinsics, torch.Tensor):
-            fx = intrinsics[0, 0].cpu().item()
-            fy = intrinsics[1, 1].cpu().item()
-            cx = intrinsics[0, 2].cpu().item()
-            cy = intrinsics[1, 2].cpu().item()
-        else:
-            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-            cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-        
-        # proiezione
-        u = int((fx * X_cam[0] / X_cam[2]) + cx)
-        v = int((fy * X_cam[1] / X_cam[2]) + cy)
-        if not (0 <= u < width and 0 <= v < height):
-            out_of_bounds += 1
-            continue
-        
-        # Z-buffer test
-        if X_cam[2] < Z_buf[v, u]:
-            Z_buf[v, u] = X_cam[2]
-            Img[v, u]   = cols_np[k]
-            Mask[v, u]  = 1
-            projected_count += 1
-    
-    
-    # Salva risultato (opzionale)
-    cv2.imwrite("zbuffer_result_filled.png", cv2.cvtColor(Img, cv2.COLOR_RGB2BGR))
-    cv2.imwrite("zbuffer_mask.png", Mask * 255)  # bianco dove c'è un punto
-    
-    # Prepara tensori per la rete
-    input_image = (torch.tensor(Img, dtype=torch.float32)
-                   .permute(2, 0, 1)[None, None] / 127.5) - 1.0
-    input_depth = torch.tensor(Z_buf, dtype=torch.float32)[None, None]
-    # sostituisci inf con profondità massima
-    max_d = input_depth[input_depth != np.inf].max() if (input_depth != np.inf).any() else 0
-    input_depth[input_depth == np.inf] = max_d
-    
-    input_mask = torch.tensor(Mask, dtype=torch.float32)[None, None]  # 0/1
-    
-    # Tutto su device
-    return (input_image.to(device),
-            input_depth.to(device),
-            input_mask.to(device),
-            Img,
-            Mask)
 
-
-def render_pointcloud_gpu_and_save(
+def renderPointcloud(
     ply_path,
     w2c_matrix,
     intrinsics,
     height,
     width,
     device='cuda',
-    out_rgb="render_gpu.png",
-    out_mask="mask_gpu.png",
-    out_depth="depth_gpu.npy",
+    out_rgb="render.png",
+    out_mask="mask.png",
+    out_depth="depth.npy",
     point_radius=0.001,
     saveRendered=False,
 ):
-    # 1) Load PLY
+    # load PLY
     pts_np, cols_np = load_ply_robust(ply_path)
     if cols_np is None:
         cols_np = np.full((len(pts_np), 3), [255, 0, 0], dtype=np.uint8)
 
-    # 2) To tensors on device
-    pts = torch.from_numpy(pts_np).float().to(device)
-    rgb = torch.from_numpy(cols_np).float().to(device) / 255.0
-
-    # 3) Build Pointclouds
-    pointcloud = Pointclouds(points=[pts], features=[rgb])
-
-    # 4) Prepare extrinsic & intrinsic parameters
-    # Ensure w2c and K are torch tensors on device
-    if not isinstance(w2c_matrix, torch.Tensor):
-        w2c = torch.from_numpy(w2c_matrix).float().to(device)
-    else:
-        w2c = w2c_matrix.to(device)
-    if not isinstance(intrinsics, torch.Tensor):
-        K = torch.from_numpy(intrinsics).float().to(device)
-    else:
-        K = intrinsics.to(device)
-
-    # Extract rotation and translation (OpenCV convention: X_cam = R @ X_world + t)
-    R = w2c[:3, :3].unsqueeze(0)  # (1,3,3)
-    t = w2c[:3, 3].unsqueeze(0)   # (1,3)
-
-    # 5) Create PyTorch3D camera via conversion utility to ensure correct conventions
-    image_size = torch.tensor([[height, width]], device=device)
-    cameras = cameras_from_opencv_projection(
-        R, t, K.unsqueeze(0), image_size
-    )  # uses K as OpenCV intrinsics
-
-    # 6) Rasterization & rendering setup
-    raster_settings = PointsRasterizationSettings(
-        image_size=(height, width),
-        radius=point_radius,
-        points_per_pixel=10,
-        bin_size=128, # wuth 128, 1 M it works in 7 minutes
-        max_points_per_bin=1000000,
-    )
-    rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
-    renderer = PointsRenderer(rasterizer=rasterizer, compositor=AlphaCompositor())
-
-    # 7) Render
-    fragments = rasterizer(pointcloud)
-    rendered = renderer(pointcloud)[0]  # (H,W,3)
-
-    # 8) Extract GPU tensors
-    rgb_t = (rendered[..., :3] * 255).byte()
-    mask_t = (fragments.idx[0, ..., 0] >= 0).byte()
-    depth_t = fragments.zbuf[0, ..., 0]
-
-    # 9) Optional saving
-    if saveRendered:
-        rgb_np = rgb_t.cpu().numpy()
-        mask_np = (mask_t.cpu().numpy() * 255).astype(np.uint8)
-        depth_np = depth_t.cpu().numpy().astype(np.float32)
-        cv2.imwrite(out_rgb, cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(out_mask, mask_np)
-        np.save(out_depth, depth_np)
-
-    # 10) Normalize outputs for network input
-    rgb_tensor = rgb_t.permute(2, 0, 1)[None].float() / 127.5 - 1.0
-    depth_tensor = depth_t[None, None]
-    mask_tensor = mask_t[None, None].float()
-
-    return rgb_tensor, depth_tensor, mask_tensor
-
-def render_pointcloud_gpu_and_save(
-    ply_path,
-    w2c_matrix,
-    intrinsics,
-    height,
-    width,
-    device='cuda',
-    out_rgb="render_gpu.png",
-    out_mask="mask_gpu.png",
-    out_depth="depth_gpu.npy",
-    point_radius=0.001,
-    saveRendered=False,
-):
-    # 1) Load PLY
-    pts_np, cols_np = load_ply_robust(ply_path)
-    if cols_np is None:
-        cols_np = np.full((len(pts_np), 3), [255, 0, 0], dtype=np.uint8)
-
-    # 2) To tensors on device
+    # to tensors on device
     pts = torch.from_numpy(pts_np).float().to(device)           # (N,3)
     rgb = torch.from_numpy(cols_np).float().to(device) / 255.0  # (N,3)
 
-    # 3) Compute linear depths in camera-space
+    # compute linear depths in camera-space
     #    X_cam = R @ X_world + t
     if not isinstance(w2c_matrix, torch.Tensor):
         w2c = torch.from_numpy(w2c_matrix).float().to(device)
@@ -430,14 +276,14 @@ def render_pointcloud_gpu_and_save(
     ones = torch.ones((pts.shape[0], 1), device=device)
     pts_h = torch.cat([pts, ones], dim=1)
 
-    # pts_cam_h: (N,4) -> we only need Z
+    # pts_cam_h: (N,4) 
     pts_cam_h = (w2c @ pts_h.T).T
-    linear_depths = pts_cam_h[:, 2]               # (N,) distanze ≥ 0
+    linear_depths = pts_cam_h[:, 2]               
 
-    # 4) Build Pointclouds
+    # build Pointclouds
     pointcloud = Pointclouds(points=[pts], features=[rgb])
 
-    # 5) Prepare intrinsics for renderer
+    # prepare intrinsics for renderer
     if not isinstance(intrinsics, torch.Tensor):
         K = torch.from_numpy(intrinsics).float().to(device)
     else:
@@ -450,7 +296,7 @@ def render_pointcloud_gpu_and_save(
         R_batch, t_batch, K.unsqueeze(0), image_size
     )
 
-    # 6) Rasterization & rendering setup
+    # rasterization & rendering setup
     raster_settings = PointsRasterizationSettings(
         image_size=(height, width),
         radius=point_radius,
@@ -461,21 +307,19 @@ def render_pointcloud_gpu_and_save(
     rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
     renderer = PointsRenderer(rasterizer=rasterizer, compositor=AlphaCompositor())
 
-    # 7) Render RGB & mask
+    # render RGB & mask
     fragments = rasterizer(pointcloud)
     rendered = renderer(pointcloud)[0]  # (H,W,3)
     rgb_t  = (rendered[..., :3] * 255).byte()
     mask_t = (fragments.idx[0, ..., 0] >= 0).byte()
 
-    # 8) Build linear-depth map
-    #    fragments.idx tells, per pixel, quale punto (k) è visibile
-    idx_map = fragments.idx[0, ..., 0]            # (H,W) indice k o -1
+    # build linear-depth map
+    idx_map = fragments.idx[0, ..., 0]            
     depth_lin = torch.zeros_like(idx_map, dtype=torch.float32, device=device)
-    # assegna linear_depths[k] alle corrispondenti posizioni pixel
     valid = idx_map >= 0
     depth_lin[valid] = linear_depths[idx_map[valid]]
 
-    # 9) Optional saving
+    # optional saving
     if saveRendered:
         rgb_np   = rgb_t.cpu().numpy()
         mask_np  = (mask_t.cpu().numpy() * 255).astype(np.uint8)
@@ -484,12 +328,13 @@ def render_pointcloud_gpu_and_save(
         cv2.imwrite(out_mask,  mask_np)
         np.save(out_depth,     depth_np)
 
-    # 10) Normalize outputs for network input
+    # normalize outputs for network input
     rgb_tensor   = rgb_t.permute(2, 0, 1)[None].float() / 127.5 - 1.0
-    depth_tensor = depth_lin[None, None]  # (1,1,H,W), depth lineare in stesse unità del world-space
+    depth_tensor = depth_lin[None, None]  # (1,1,H,W)
     mask_tensor  = mask_t[None, None].float()
 
     return rgb_tensor, depth_tensor, mask_tensor
+
 
 
 def render_cache_objects(generated_w2cs, generated_intrinsics, height, width, save_folder="/export/scratch/lvigorel/GEN3C/rendered"):
@@ -505,8 +350,8 @@ def render_cache_objects(generated_w2cs, generated_intrinsics, height, width, sa
 
 
         # Render objects using the camera parameters
-        rgb_t, depth_t, mask_t = render_pointcloud_gpu_and_save(
-            ply_path="/export/scratch/lvigorel/GEN3C/shoePointsHalfPositionedNewPositioned.ply",
+        rgb_t, depth_t, mask_t = renderPointcloud(
+            ply_path="/export/scratch/lvigorel/GEN3Copy/PointClouds/fullEnvironment/shoePointsHalfPositionedNewPositioned.ply",
             w2c_matrix=w2c,
             intrinsics=intrinsics,
             height=height,
@@ -521,59 +366,11 @@ def render_cache_objects(generated_w2cs, generated_intrinsics, height, width, sa
         rgbs.append(rgb_t)
         depths.append(depth_t)
         masks.append(mask_t)
-    # restituisci tensori concatenati lungo la dimensione temporal/batch
+
     rgbs   = torch.cat(rgbs,   dim=0)  # (N,3,H,W)
     depths = torch.cat(depths, dim=0)  # (N,1,H,W)
     masks  = torch.cat(masks,  dim=0)  # (N,1,H,W)
     
-    return rgbs, masks, depths
-
-def render_cache_objectsZBuffer(generated_w2cs,
-                                 generated_intrinsics,
-                                 height,
-                                 width,
-                                 save_folder="/export/scratch/lvigorel/GEN3C/rendered",
-                                 ply_path="/export/scratch/lvigorel/GEN3C/shoePointsHalfPositionedNewPositioned.ply",
-                                 device='cuda',
-                                 debug=False):
-    os.makedirs(save_folder, exist_ok=True)
-    rgbs, depths, masks = [], [], []
-
-    for i in tqdm(range(generated_w2cs.shape[1])):
-        # Build per-frame file paths
-        out_rgbf   = os.path.join(save_folder, f"frame_{i:03d}_rgb.png")
-        out_maskf  = os.path.join(save_folder, f"frame_{i:03d}_mask.png")
-        out_depthf = os.path.join(save_folder, f"frame_{i:03d}_depth.npy")
-        intrinsics = generated_intrinsics[0, i]
-        w2c        = generated_w2cs[0, i]
-
-        # Use the improved Z-buffer projection
-        input_image_t, input_depth_t, input_mask_t, Img, Mask = \
-            create_zbuffer_projection_improved(
-                ply_path=ply_path,
-                w2c_matrix=w2c,
-                intrinsics=intrinsics,
-                height=height,
-                width=width,
-                device=device,
-                debug=debug
-            )
-
-        # Save per-frame outputs
-        cv2.imwrite(out_rgbf, cv2.cvtColor(Img, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(out_maskf, (Mask * 255).astype(np.uint8))
-        np.save(out_depthf, input_depth_t.squeeze().cpu().numpy())
-
-        # Collect tensors for further processing
-        rgbs.append(input_image_t)
-        depths.append(input_depth_t)
-        masks.append(input_mask_t)
-
-    # Concatenate along batch dimension
-    rgbs   = torch.cat(rgbs,   dim=0)  # (N,1,3,H,W)
-    depths = torch.cat(depths, dim=0)  # (N,1,H,W)
-    masks  = torch.cat(masks,  dim=0)  # (N,1,H,W)
-
     return rgbs, masks, depths
 
 
@@ -708,43 +505,36 @@ def demo(args):
         moge_image_b1chw_float, moge_depth_b11hw, moge_mask_b11hw, moge_initial_w2c_b144, moge_intrinsics_b133 = \
             _predict_moge_depth("/export/scratch/lvigorel/GEN3C/assets/diffusion/000.png", args.height, args.width, device, moge_model) #CI ANDREBBE CURRENT IMAGE PATH
 
-        # ─── Usa funzioni integrate per debug ───
-        ply_path = "/export/scratch/lvigorel/GEN3C/fullSceneWithShoeNewPositioned.ply"
+        ply_path = "/export/scratch/lvigorel/GEN3Copy/PointClouds/ShoePositioned/fullSceneWithShoeNewPositioned.ply"
         intr = moge_intrinsics_b133[0,0]
         w2c  = moge_initial_w2c_b144[0,0]
-        #input_img, input_depth, input_mask, dbg_img, dbg_mask = \
-        #    create_zbuffer_projection_improved(
-        #        ply_path, w2c, intr,
-        #        args.height, args.width,
-        #        device=device, debug=True
-        #    )   
-
+        
 
         # this is done because the point clouds are of a different density of points, and the rendering radius points parameter is better with to diversify   
-        input_img, input_depth, input_mask = render_pointcloud_gpu_and_save(
-            ply_path="/export/scratch/lvigorel/GEN3C/fullSceneWithShoeNewPositioned.ply",
+        input_img, input_depth, input_mask = renderPointcloud(
+            ply_path="/export/scratch/lvigorel/GEN3Copy/PointClouds/ShoePositioned/fullSceneWithShoeNewPositioned.ply",
             w2c_matrix=w2c,
             intrinsics=intr,
             height=args.height,
             width=args.width,
             device='cuda',
-            out_rgb="render_gpu.png",
-            out_mask="mask_gpu.png",
-            out_depth="depth_gpu.npy",
+            out_rgb="render.png",
+            out_mask="mask.png",
+            out_depth="depth.npy",
             point_radius=0.004, #0.003 il piu basso
             saveRendered=False,
         )
 
-        input_obj, input_depth_obj, input_mask_obj = render_pointcloud_gpu_and_save(
-            ply_path="/export/scratch/lvigorel/GEN3C/shoePointsHalfPositionedNewPositioned.ply",
+        input_obj, input_depth_obj, input_mask_obj = renderPointcloud(
+            ply_path="/export/scratch/lvigorel/GEN3Copy/PointClouds/fullEnvironment/shoePointsHalfPositionedNewPositioned.ply",
             w2c_matrix=w2c,
             intrinsics=intr,
             height=args.height,
             width=args.width,
             device='cuda',
-            out_rgb="render_gpu.png",
-            out_mask="mask_gpu.png",
-            out_depth="depth_gpu.npy",
+            out_rgb="render.png",
+            out_mask="mask.png",
+            out_depth="depth.npy",
             point_radius=0.001,
             saveRendered=False,
         )
@@ -756,7 +546,6 @@ def demo(args):
         )
 
         print("Building the cache...")
-        # Prepara buffer Cache3D con i tensori generati
         cache = Cache3D_Buffer(
             frame_buffer_max=frame_buffer_max,
             generator=generator,
@@ -783,24 +572,27 @@ def demo(args):
             device=device.type,
         )
         
-        print("Rendering cache...")
+        print("Rendering cache background...")
         warp_rgb, warp_depth, warp_mask = render_cache_full(
             cache, generated_w2cs[:, :sample_n_frames], generated_intrinsics[:, :sample_n_frames]
         )
         print("cache input image shape:", warp_rgb.shape) # (B, T, n_i, C, H, W)
         print("cache input depth shape:", warp_depth.shape) # (B, T, n_i, 1, H, W)
         print("cache input mask shape:", warp_mask.shape) # (B, T, n_i, 1, H, W)
+
+
         #frame = 0
         #obj   = 0
         
-        # estrai il primo batch, il primo frame, il primo "oggetto"
         #single_rgb  = warp_rgb[0, frame, obj]   # -> shape (3, H, W)
         #single_mask = warp_mask[0, frame, obj]  # -> shape (1, H, W)
         #rgb_np = ((single_rgb.permute(1,2,0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
         #mask_np = (single_mask[0].cpu().numpy() * 255).astype(np.uint8)
         #cv2.imwrite("debug_warp_rgb.png", rgb_np[:,:,::-1])  # BGR per OpenCV
         #cv2.imwrite("debug_warp_mask.png", mask_np)
-        print("Rendering cache objects...")
+
+
+        print("Rendering cache object...")
         objRgb, objMask, objDepth = render_cache_objects(
             generated_w2cs[:, :sample_n_frames],
             generated_intrinsics[:, :sample_n_frames],
@@ -828,10 +620,10 @@ def demo(args):
         
         
 
-        # 4) Pass fused images/masks to the generation pipeline
+        # pass fused images/masks to the generation pipeline
         generated_output = pipeline.generate(
             prompt=current_prompt,
-            image_path="/export/scratch/lvigorel/GEN3C/render_gpu.png",
+            image_path="/export/scratch/lvigorel/GEN3Copy/ShoeRendering.png",
             negative_prompt=args.negative_prompt,
             rendered_warp_images=fused_rgb,
             rendered_warp_masks=fused_mask,

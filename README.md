@@ -1,9 +1,35 @@
-# GEN3C: 3D-Informed World-Consistent Video Generation with Precise Camera Control
+# OBJECT DRIVEN VIDEO GENERATION
 
 <!-- Note: this video is hosted by GitHub and gets embedded automatically when viewing in the GitHub UI -->
 
 https://github.com/user-attachments/assets/247e1719-9f8f-4504-bfa3-f9706bd8682d
 
+
+This work, starts from the pipeline of GEN3C paper from Nvidia, and wants to include in this pipeline the possibility to insert and object in it, of which you have a 3D representation (Point Cloud for now, Meshes later).
+In particular inserting the object in a video being generated from a single background image
+There are 2 possibilities to do that:
+- fused 
+- full 
+
+To be able to run the code:
+- install everything about GEN3C base model following the instruction below
+- install missing libraris (don't have a list for now, they are imported in renderingCache.py and renderingCache.py2 files)
+
+The pipeline for now works by:
+- using exportPointCloud to export the file
+- modify the exported pointCloud in Blender, inserting the object (need to have a PointCloud of the object) where you prefer
+- exporting the Shoe alone and the full environment from blender and save them in the correct directory 
+- run renderingCache.py or renderingCache2.py depending on the method you want to use (2 runs, the first one you just need to obtain the rendering as initial image (ShoeRendering.png), when you have the file you can just re-run again and complete the run, since I haven't yet canged the original class, where thay want the path and not the image values)
+
+The idea for later is to change the steps in order to have a clean pipeline 
+
+
+INPUT AND OUTPUTS SHOULD STAY THE SAME IN THE PIPELINE BUT NEED TO CHANGE: 
+- create  a class for the cache with the new rendering methods and data attributes
+- change renderCache2, the way things  are done is okei, but it is done some useless stuff in the way (so need to create new functions)
+
+
+## Base model information
 
 **GEN3C: 3D-Informed World-Consistent Video Generation with Precise Camera Control**<br>
 [Xuanchi Ren*](https://xuanchiren.com/),
@@ -40,8 +66,6 @@ monocular dynamic video. Results are best viewed in videos.
 For business inquiries, please visit our website and submit the form: [NVIDIA Research Licensing](https://www.nvidia.com/en-us/research/inquiries/).
 For any other questions related to the model, please contact Xuanchi, Tianchang or Jun.
 
-## News
-- 2025-06-06 Code and model released! In a future update, we plan to include the pipeline for jointly predicting depth and camera pose from video, as well as a driving-finetuned model. Stay tuned!
 
 ## Installation
 Please follow the "Inference" section in [INSTALL.md](INSTALL.md) to set up your environment.
